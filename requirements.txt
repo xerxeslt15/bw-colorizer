@@ -1,0 +1,8 @@
+customtkinter>=5.2.0
+opencv-python>=4.9.0
+numpy
+pillow
+tqdm
+huggingface-hub
+# torch wird separat installiert (siehe setup.bat) - CUDA-Build je nach GPU!
+# DDColor selbst wird von setup.bat als Code (kein pip-Paket) nach backends/DDColor geladen.
