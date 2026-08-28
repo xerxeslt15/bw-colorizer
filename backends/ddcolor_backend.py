@@ -3,24 +3,33 @@ Colorization-Backend auf Basis des offiziellen DDColor-Codes
 (https://github.com/piddnad/DDColor, ICCV 2023).
 
 Implementiert die Lab-Pipeline selbst (statt die fertige
-ColorizationPipeline aus dem Repo zu nutzen), damit wir zwei Dinge
-nachbessern können, die bei roher Frame-für-Frame-Colorization von
-Videos typischerweise stören:
+ColorizationPipeline aus dem Repo zu nutzen), damit wir Dinge
+nachbessern koennen, die bei roher Frame-fuer-Frame-Colorization von
+Videos typischerweise stoeren:
 
   1. Saettigung: DDColor faerbt von Haus aus recht kraeftig/grell ein.
      `saturation` (0-1) daempft die Farbintensitaet.
-  2. Flackern: Jedes Frame wird eigentlich unabhaengig eingefaerbt, was
-     bei Videos zu leicht wechselnden Farbtoenen von Frame zu Frame
-     fuehrt. Dagegen wirken zwei Mechanismen zusammen:
-     a) `stats_smoothing`: der globale Farbton (Mittelwert/Streuung der
-        a/b-Kanaele) wird per gleitendem Durchschnitt ueber die Zeit
-        stabilisiert - das faengt den Hauptteil des Flackerns ab
-        (frame-weise schwankende Gesamtfaerbung/Saettigung).
-     b) `temporal_smoothing`: zusaetzlich werden die a/b-Kanaele mit dem
-        (per Optical Flow bewegungsausgeglichenen) Vorgaenger-Frame
-        gemischt - das daempft noch lokale, ortsgebundene Unterschiede.
-     Beide 0-1, hoehere Werte = ruhiger, aber traeger bei echten
-     Farbwechseln (z.B. Schnitt auf eine andere Szene).
+
+  2. Globales Flackern (Farbton schwankt insgesamt von Frame zu Frame):
+     `stats_smoothing` zieht den mittleren Farbton sanft in Richtung
+     eines gleitenden Durchschnitts. Bewusst NUR der Mittelwert, keine
+     Streuungs-Angleichung mehr (eine fruehere Version hat versucht,
+     auch die Streuung anzugleichen - das hat bei Frames mit wenig
+     vorhergesagter Farbe [kleine Streuung] das Rauschen hochskaliert
+     und dadurch Aussetzer noch verstaerkt statt sie zu daempfen).
+
+  3. "Aussetzer" (Modell faerbt einen Frame kaum ein -> wirkt fast S/W):
+     Die durchschnittliche Farbintensitaet jedes Frames wird mit einem
+     laufenden Referenzwert verglichen. Faellt sie deutlich ab, wird
+     automatisch staerker auf den (bewegungsausgeglichenen)
+     Vorgaenger-Frame zurueckgegriffen, statt den Farbverlust zu
+     uebernehmen. Das verhindert das Hin-und-Herspringen zwischen
+     "farbig" und "fast S/W".
+
+  4. Lokales Flackern: die a/b-Kanaele werden zusaetzlich mit dem per
+     Optical Flow (Farneback) bewegungsausgeglichenen Vorgaenger-Frame
+     gemischt (`temporal_smoothing`), um kleinraeumige Unterschiede zu
+     daempfen, ohne bei Bewegung zu verschmieren.
 
 Modellgewichte kommen automatisch von Hugging Face Hub beim ersten
 Start (Cache: ~/.cache/huggingface).
@@ -47,8 +56,12 @@ class DDColorBackend:
         model_name: str = "ddcolor_modelscope",
         input_size: int = 512,
         saturation: float = 0.75,
-        temporal_smoothing: float = 0.55,
+        temporal_smoothing: float = 0.7,
         stats_smoothing: float = 0.9,
+        mean_shift_strength: float = 0.5,
+        dropout_ratio_threshold: float = 0.5,
+        dropout_smoothing: float = 0.9,
+        spatial_blur_ksize: int = 0,  # 0 = automatisch aus Aufloesung berechnen
     ):
         self.device = device
         self.model_name = model_name
@@ -56,13 +69,21 @@ class DDColorBackend:
         self.saturation = saturation
         self.temporal_smoothing = temporal_smoothing
         self.stats_smoothing = stats_smoothing
+        self.mean_shift_strength = mean_shift_strength
+        # Schwelle: faellt die Farbintensitaet eines Frames unter diesen
+        # Anteil des laufenden Durchschnitts, gilt er als "Aussetzer".
+        self.dropout_ratio_threshold = dropout_ratio_threshold
+        # Wie stark bei einem erkannten Aussetzer auf den Vorgaenger-Frame
+        # zurueckgegriffen wird (0-1, hoeher = staerker).
+        self.dropout_smoothing = dropout_smoothing
+        self.spatial_blur_ksize = spatial_blur_ksize
 
         self._model = None
         self._torch_device = None
         self._prev_ab = None  # fuer zeitliche Glaettung zwischen Frames
         self._prev_gray = None  # fuer Optical-Flow-Berechnung
         self._running_mean = None  # fuer globale Farbton-Stabilisierung
-        self._running_std = None
+        self._running_mag = None  # fuer Aussetzer-Erkennung
 
     def load(self, log=print):
         if self._model is not None:
@@ -101,30 +122,44 @@ class DDColorBackend:
 
     def reset_temporal(self):
         """Vor jedem neuen Video aufrufen, damit die Glaettung nicht mit
-        Farbwerten aus dem vorherigen Video startet."""
+        Werten aus dem vorherigen Video startet."""
         self._prev_ab = None
         self._prev_gray = None
         self._running_mean = None
-        self._running_std = None
+        self._running_mag = None
 
-    def _stabilize_color_stats(self, ab: np.ndarray) -> np.ndarray:
-        """Gleicht Mittelwert/Streuung der a/b-Kanaele an einen ueber die
-        Zeit gleitenden Durchschnitt an - daempft globales Flackern des
-        Farbtons (z.B. mal insgesamt waermer, mal insgesamt blasser)."""
-        eps = 1e-6
+    def _shift_color_mean(self, ab: np.ndarray) -> np.ndarray:
+        """Zieht den mittleren Farbton sanft Richtung gleitendem
+        Durchschnitt (nur Verschiebung, keine Streuungs-Skalierung -
+        das bleibt numerisch stabil, auch bei fast farblosen Frames)."""
         flat = ab.reshape(-1, 2)
         cur_mean = flat.mean(axis=0)
-        cur_std = flat.std(axis=0) + eps
 
         if self._running_mean is None:
             self._running_mean = cur_mean
-            self._running_std = cur_std
             return ab
 
         self._running_mean = self.stats_smoothing * self._running_mean + (1 - self.stats_smoothing) * cur_mean
-        self._running_std = self.stats_smoothing * self._running_std + (1 - self.stats_smoothing) * cur_std
+        shift = (self._running_mean - cur_mean) * self.mean_shift_strength
+        return ab + shift
 
-        return (ab - cur_mean) / cur_std * self._running_std + self._running_mean
+    def _detect_dropout_ratio(self, ab: np.ndarray) -> float:
+        """Vergleicht die Farbintensitaet des aktuellen Frames mit dem
+        laufenden Durchschnitt. Gibt einen Faktor 0-1 zurueck: 1 = normal,
+        0 = kompletter Aussetzer (praktisch keine Farbe vorhergesagt)."""
+        cur_mag = float(np.sqrt((ab ** 2).sum(axis=-1)).mean())
+
+        if self._running_mag is None:
+            self._running_mag = cur_mag
+            return 1.0
+
+        ratio = cur_mag / (self._running_mag + 1e-6)
+        # Referenzwert langsam nachfuehren (aber nicht von Aussetzern
+        # herunterziehen lassen, damit die Erkennung stabil bleibt)
+        if ratio > 0.7:
+            self._running_mag = self.dropout_smoothing * self._running_mag + (1 - self.dropout_smoothing) * cur_mag
+
+        return min(ratio, 1.0)
 
     def _warp_prev_ab(self, gray: np.ndarray) -> np.ndarray | None:
         """Verschiebt die a/b-Kanaele des vorherigen Frames per Optical
@@ -166,6 +201,14 @@ class DDColorBackend:
         orig_l = cv2.cvtColor(img, cv2.COLOR_BGR2Lab)[:, :, :1]
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 
+        # Blur-Kernelgroesse einmalig aus der Aufloesung ableiten (falls
+        # nicht explizit gesetzt) - ca. 1% der kleineren Bildkante, ungerade
+        if self.spatial_blur_ksize == 0:
+            k = max(3, round(min(height, width) * 0.01))
+            if k % 2 == 0:
+                k += 1
+            self.spatial_blur_ksize = k
+
         img_resized = cv2.resize(img, (self.input_size, self.input_size))
         img_l = cv2.cvtColor(img_resized, cv2.COLOR_BGR2Lab)[:, :, :1]
         img_gray_lab = np.concatenate((img_l, np.zeros_like(img_l), np.zeros_like(img_l)), axis=-1)
@@ -192,17 +235,36 @@ class DDColorBackend:
         # 1) Saettigung daempfen
         output_ab_resized = output_ab_resized * self.saturation
 
-        # 2) Globalen Farbton stabilisieren (Hauptursache fuer Flackern)
-        if self.stats_smoothing > 0:
-            output_ab_resized = self._stabilize_color_stats(output_ab_resized)
+        # 1b) Raeumlich leicht weichzeichnen (nur Farbe, nicht Helligkeit!)
+        #     Das entfernt feines, pixelnahes Farbrauschen, das von Frame zu
+        #     Frame unabhaengig neu entsteht und als Flackern auffaellt -
+        #     das Auge ist fuer Farbdetails ohnehin viel unempfindlicher
+        #     als fuer Helligkeit (genau wie bei der Chroma-Subsampling-
+        #     Praxis in Videocodecs).
+        if self.spatial_blur_ksize > 1:
+            output_ab_resized = cv2.GaussianBlur(
+                output_ab_resized, (self.spatial_blur_ksize, self.spatial_blur_ksize), 0
+            )
 
-        # 3) Zusaetzlich lokale, bewegungsausgeglichene Glaettung
-        if self.temporal_smoothing > 0:
+        # 2) Globalen Farbton sanft angleichen
+        if self.stats_smoothing > 0 and self.mean_shift_strength > 0:
+            output_ab_resized = self._shift_color_mean(output_ab_resized)
+
+        # 3) Aussetzer erkennen (Frame hat viel weniger Farbe als ueblich)
+        dropout_ratio = self._detect_dropout_ratio(output_ab_resized)
+
+        # 4) Lokale, bewegungsausgeglichene Glaettung - bei erkanntem
+        #    Aussetzer deutlich staerker, um den Sprung zu S/W zu vermeiden
+        effective_smoothing = self.temporal_smoothing
+        if dropout_ratio < self.dropout_ratio_threshold:
+            effective_smoothing = max(self.temporal_smoothing, 0.85)
+
+        if effective_smoothing > 0:
             warped_prev_ab = self._warp_prev_ab(gray)
             if warped_prev_ab is not None and warped_prev_ab.shape == output_ab_resized.shape:
                 output_ab_resized = (
-                    self.temporal_smoothing * warped_prev_ab
-                    + (1 - self.temporal_smoothing) * output_ab_resized
+                    effective_smoothing * warped_prev_ab
+                    + (1 - effective_smoothing) * output_ab_resized
                 )
 
         self._prev_ab = output_ab_resized
