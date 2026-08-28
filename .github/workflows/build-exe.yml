@@ -1,1 +1,58 @@
+name: Build BW Colorizer EXE
 
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Code auschecken
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: PyTorch installieren (CUDA 12.8, RTX 50xx / Blackwell kompatibel)
+        run: |
+          pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+
+      - name: Restliche Abhängigkeiten installieren
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: DDColor-Code herunterladen
+        shell: cmd
+        run: |
+          curl -L -o ddcolor_src.zip https://github.com/piddnad/DDColor/archive/refs/heads/master.zip
+          tar -xf ddcolor_src.zip
+          move /Y DDColor-master backends\DDColor
+          del ddcolor_src.zip
+
+      - name: EXE bauen (PyInstaller)
+        shell: cmd
+        run: |
+          pyinstaller --noconfirm --clean --name BWColorizer --onedir --console ^
+            --collect-all torch --collect-all torchvision --collect-all customtkinter ^
+            --collect-all cv2 --collect-all huggingface_hub ^
+            --add-data "backends/DDColor;backends/DDColor" ^
+            main.py
+
+      - name: Build-Ordner packen
+        shell: powershell
+        run: |
+          Compress-Archive -Path dist\BWColorizer\* -DestinationPath BWColorizer-windows.zip
+
+      - name: Als Artefakt hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: BWColorizer-windows
+          path: BWColorizer-windows.zip
+          retention-days: 14
