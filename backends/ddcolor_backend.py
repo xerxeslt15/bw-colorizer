@@ -12,9 +12,13 @@ Videos typischerweise stören:
   2. Flackern: Jedes Frame wird eigentlich unabhaengig eingefaerbt, was
      bei Videos zu leicht wechselnden Farbtoenen von Frame zu Frame
      fuehrt. `temporal_smoothing` (0-1) blendet die Farbkanaele (a/b in
-     Lab) mit dem Vorgaenger-Frame, um das zu daempfen. 0 = aus,
-     hoehere Werte = ruhiger, aber traeger bei echten Farbwechseln
-     (z.B. Schnitt auf eine andere Szene).
+     Lab) mit dem Vorgaenger-Frame, um das zu daempfen. Die Vorgaenger-
+     Farbwerte werden dabei per Optical Flow (Farneback) an die Bewegung
+     im Bild angepasst, bevor sie eingemischt werden - das vermeidet
+     Geisterbilder/Unschaerfe bei bewegten Szenen, die eine simple
+     Mittelung ohne Bewegungsausgleich verursachen wuerde.
+     0 = aus, hoehere Werte = ruhiger, aber traeger bei echten
+     Farbwechseln (z.B. Schnitt auf eine andere Szene).
 
 Modellgewichte kommen automatisch von Hugging Face Hub beim ersten
 Start (Cache: ~/.cache/huggingface).
@@ -41,7 +45,7 @@ class DDColorBackend:
         model_name: str = "ddcolor_modelscope",
         input_size: int = 512,
         saturation: float = 0.75,
-        temporal_smoothing: float = 0.4,
+        temporal_smoothing: float = 0.55,
     ):
         self.device = device
         self.model_name = model_name
@@ -52,6 +56,7 @@ class DDColorBackend:
         self._model = None
         self._torch_device = None
         self._prev_ab = None  # fuer zeitliche Glaettung zwischen Frames
+        self._prev_gray = None  # fuer Optical-Flow-Berechnung
 
     def load(self, log=print):
         if self._model is not None:
@@ -92,6 +97,35 @@ class DDColorBackend:
         """Vor jedem neuen Video aufrufen, damit die Glaettung nicht mit
         Farbwerten aus dem vorherigen Video startet."""
         self._prev_ab = None
+        self._prev_gray = None
+
+    def _warp_prev_ab(self, gray: np.ndarray) -> np.ndarray | None:
+        """Verschiebt die a/b-Kanaele des vorherigen Frames per Optical
+        Flow, damit sie zur Bewegung im aktuellen Frame passen. Gibt None
+        zurueck, wenn kein Vorgaenger vorhanden ist oder die Berechnung
+        fehlschlaegt (dann wird ohne Glaettung weitergemacht)."""
+        if self._prev_gray is None or self._prev_ab is None:
+            return None
+        if self._prev_gray.shape != gray.shape:
+            return None
+
+        try:
+            flow = cv2.calcOpticalFlowFarneback(
+                self._prev_gray, gray, None,
+                pyr_scale=0.5, levels=3, winsize=15,
+                iterations=3, poly_n=5, poly_sigma=1.2, flags=0,
+            )
+            h, w = gray.shape
+            grid_x, grid_y = np.meshgrid(np.arange(w), np.arange(h))
+            map_x = (grid_x + flow[..., 0]).astype(np.float32)
+            map_y = (grid_y + flow[..., 1]).astype(np.float32)
+            warped = cv2.remap(
+                self._prev_ab, map_x, map_y,
+                interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+            )
+            return warped
+        except cv2.error:
+            return None
 
     def colorize_frame(self, frame_bgr: np.ndarray) -> np.ndarray:
         if self._model is None:
@@ -103,6 +137,7 @@ class DDColorBackend:
         height, width = frame_bgr.shape[:2]
         img = (frame_bgr / 255.0).astype(np.float32)
         orig_l = cv2.cvtColor(img, cv2.COLOR_BGR2Lab)[:, :, :1]
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 
         img_resized = cv2.resize(img, (self.input_size, self.input_size))
         img_l = cv2.cvtColor(img_resized, cv2.COLOR_BGR2Lab)[:, :, :1]
@@ -130,13 +165,17 @@ class DDColorBackend:
         # 1) Saettigung daempfen
         output_ab_resized = output_ab_resized * self.saturation
 
-        # 2) Zeitliche Glaettung gegen Flackern
-        if self.temporal_smoothing > 0 and self._prev_ab is not None and self._prev_ab.shape == output_ab_resized.shape:
-            output_ab_resized = (
-                self.temporal_smoothing * self._prev_ab
-                + (1 - self.temporal_smoothing) * output_ab_resized
-            )
+        # 2) Zeitliche Glaettung gegen Flackern (bewegungsausgeglichen)
+        if self.temporal_smoothing > 0:
+            warped_prev_ab = self._warp_prev_ab(gray)
+            if warped_prev_ab is not None and warped_prev_ab.shape == output_ab_resized.shape:
+                output_ab_resized = (
+                    self.temporal_smoothing * warped_prev_ab
+                    + (1 - self.temporal_smoothing) * output_ab_resized
+                )
+
         self._prev_ab = output_ab_resized
+        self._prev_gray = gray
 
         output_lab = np.concatenate((orig_l, output_ab_resized), axis=-1)
         output_bgr = cv2.cvtColor(output_lab, cv2.COLOR_LAB2BGR)
