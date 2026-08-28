@@ -11,13 +11,15 @@ Videos typischerweise stören:
      `saturation` (0-1) daempft die Farbintensitaet.
   2. Flackern: Jedes Frame wird eigentlich unabhaengig eingefaerbt, was
      bei Videos zu leicht wechselnden Farbtoenen von Frame zu Frame
-     fuehrt. `temporal_smoothing` (0-1) blendet die Farbkanaele (a/b in
-     Lab) mit dem Vorgaenger-Frame, um das zu daempfen. Die Vorgaenger-
-     Farbwerte werden dabei per Optical Flow (Farneback) an die Bewegung
-     im Bild angepasst, bevor sie eingemischt werden - das vermeidet
-     Geisterbilder/Unschaerfe bei bewegten Szenen, die eine simple
-     Mittelung ohne Bewegungsausgleich verursachen wuerde.
-     0 = aus, hoehere Werte = ruhiger, aber traeger bei echten
+     fuehrt. Dagegen wirken zwei Mechanismen zusammen:
+     a) `stats_smoothing`: der globale Farbton (Mittelwert/Streuung der
+        a/b-Kanaele) wird per gleitendem Durchschnitt ueber die Zeit
+        stabilisiert - das faengt den Hauptteil des Flackerns ab
+        (frame-weise schwankende Gesamtfaerbung/Saettigung).
+     b) `temporal_smoothing`: zusaetzlich werden die a/b-Kanaele mit dem
+        (per Optical Flow bewegungsausgeglichenen) Vorgaenger-Frame
+        gemischt - das daempft noch lokale, ortsgebundene Unterschiede.
+     Beide 0-1, hoehere Werte = ruhiger, aber traeger bei echten
      Farbwechseln (z.B. Schnitt auf eine andere Szene).
 
 Modellgewichte kommen automatisch von Hugging Face Hub beim ersten
@@ -46,17 +48,21 @@ class DDColorBackend:
         input_size: int = 512,
         saturation: float = 0.75,
         temporal_smoothing: float = 0.55,
+        stats_smoothing: float = 0.9,
     ):
         self.device = device
         self.model_name = model_name
         self.input_size = input_size
         self.saturation = saturation
         self.temporal_smoothing = temporal_smoothing
+        self.stats_smoothing = stats_smoothing
 
         self._model = None
         self._torch_device = None
         self._prev_ab = None  # fuer zeitliche Glaettung zwischen Frames
         self._prev_gray = None  # fuer Optical-Flow-Berechnung
+        self._running_mean = None  # fuer globale Farbton-Stabilisierung
+        self._running_std = None
 
     def load(self, log=print):
         if self._model is not None:
@@ -98,6 +104,27 @@ class DDColorBackend:
         Farbwerten aus dem vorherigen Video startet."""
         self._prev_ab = None
         self._prev_gray = None
+        self._running_mean = None
+        self._running_std = None
+
+    def _stabilize_color_stats(self, ab: np.ndarray) -> np.ndarray:
+        """Gleicht Mittelwert/Streuung der a/b-Kanaele an einen ueber die
+        Zeit gleitenden Durchschnitt an - daempft globales Flackern des
+        Farbtons (z.B. mal insgesamt waermer, mal insgesamt blasser)."""
+        eps = 1e-6
+        flat = ab.reshape(-1, 2)
+        cur_mean = flat.mean(axis=0)
+        cur_std = flat.std(axis=0) + eps
+
+        if self._running_mean is None:
+            self._running_mean = cur_mean
+            self._running_std = cur_std
+            return ab
+
+        self._running_mean = self.stats_smoothing * self._running_mean + (1 - self.stats_smoothing) * cur_mean
+        self._running_std = self.stats_smoothing * self._running_std + (1 - self.stats_smoothing) * cur_std
+
+        return (ab - cur_mean) / cur_std * self._running_std + self._running_mean
 
     def _warp_prev_ab(self, gray: np.ndarray) -> np.ndarray | None:
         """Verschiebt die a/b-Kanaele des vorherigen Frames per Optical
@@ -165,7 +192,11 @@ class DDColorBackend:
         # 1) Saettigung daempfen
         output_ab_resized = output_ab_resized * self.saturation
 
-        # 2) Zeitliche Glaettung gegen Flackern (bewegungsausgeglichen)
+        # 2) Globalen Farbton stabilisieren (Hauptursache fuer Flackern)
+        if self.stats_smoothing > 0:
+            output_ab_resized = self._stabilize_color_stats(output_ab_resized)
+
+        # 3) Zusaetzlich lokale, bewegungsausgeglichene Glaettung
         if self.temporal_smoothing > 0:
             warped_prev_ab = self._warp_prev_ab(gray)
             if warped_prev_ab is not None and warped_prev_ab.shape == output_ab_resized.shape:
