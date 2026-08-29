@@ -69,15 +69,22 @@ def colorize_video(
     progress_cb: Callable[[int, int, str], None] = lambda done, total, msg: None,
     cancel_flag: Optional[Callable[[], bool]] = None,
     jpeg_quality: int = 2,
+    log_cb: Optional[Callable[[str], None]] = None,
 ) -> None:
     """
     Färbt ein einzelnes Video vollständig ein.
 
-    progress_cb(done, total, message) wird laufend aufgerufen.
+    progress_cb(done, total, message) wird laufend aufgerufen (Fortschritt,
+    ueberschreibt sich staendig).
+    log_cb(message) wird für dauerhafte Log-Zeilen aufgerufen (z.B. Backend-
+    Diagnose-Ausgaben) - faellt auf progress_cb zurueck, falls nicht gesetzt.
     cancel_flag() sollte True zurückgeben, sobald der Nutzer abbrechen will.
     """
     input_path = str(input_path)
     output_path = str(output_path)
+
+    if log_cb is None:
+        log_cb = lambda m: progress_cb(0, 0, m)
 
     info = probe_video(input_path)
     progress_cb(0, info.frame_count, f"Analysiere Video: {info.width}x{info.height} @ {info.fps:.2f} fps, {info.frame_count} Frames")
@@ -98,18 +105,38 @@ def colorize_video(
         subprocess.run(extract_cmd, check=True, capture_output=True)
 
         # --- 2. Frames einfärben ---
-        backend.load(log=lambda m: progress_cb(0, info.frame_count, m))
+        backend.load(log=log_cb)
         if hasattr(backend, "reset_temporal"):
             backend.reset_temporal()
 
         frame_files = sorted(frames_dir.glob("frame_*.jpg"))
         total = len(frame_files) or info.frame_count
 
+        prev_hist = None
+        cut_count = 0
+
         for i, fpath in enumerate(frame_files, start=1):
             if cancel_flag and cancel_flag():
                 raise CancelledError("Vom Nutzer abgebrochen")
 
             frame_bgr = cv2.imread(str(fpath))
+
+            # Szenenschnitt erkennen: bei starkem Bildwechsel die zeitliche
+            # Glaettung zuruecksetzen, damit keine Farbwerte der voran-
+            # gegangenen (unzusammenhaengenden) Szene eingemischt werden.
+            # Sonst "haengt" nach jedem Schnitt fuer ~15-20 Frames eine
+            # falsche Uebergangsfarbe im Bild (Hauptursache fuer Flackern
+            # ueber den ganzen Film verteilt).
+            small = cv2.resize(frame_bgr, (64, 64))
+            hist = cv2.calcHist([small], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+            hist = cv2.normalize(hist, hist).flatten()
+            if prev_hist is not None:
+                similarity = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL)
+                if similarity < 0.85 and hasattr(backend, "reset_temporal"):
+                    backend.reset_temporal()
+                    cut_count += 1
+            prev_hist = hist
+
             colored = backend.colorize_frame(frame_bgr)
 
             # Ausgabegröße an Originalauflösung angleichen, falls das Modell
@@ -122,6 +149,8 @@ def colorize_video(
 
             if i % 5 == 0 or i == total:
                 progress_cb(i, total, f"Färbe Frame {i}/{total} ein...")
+
+        log_cb(f"Szenenschnitte erkannt und Glaettung zurueckgesetzt: {cut_count}x")
 
         # --- 4. Video wieder zusammensetzen (Ton direkt aus dem Original) ---
         progress_cb(total, total, "Setze Video zusammen (ffmpeg)...")

@@ -185,10 +185,17 @@ class BWColorizerApp(ctk.CTk):
             def progress_cb(done, total, msg, idx=idx, total_files=total_files):
                 self.msg_queue.put(("progress", idx, total_files, done, total, msg))
 
+            def log_cb(msg, idx=idx, total_files=total_files):
+                # Landet dauerhaft im Log-Fenster UND (falls per Konsole
+                # gestartet, z.B. PowerShell/CMD) direkt im Terminal.
+                print(f"[{idx}/{total_files}] {msg}")
+                self.msg_queue.put(("status", f"[{idx}/{total_files}] {msg}"))
+
             try:
                 colorize_video(
                     src, out_path, self.backend,
                     progress_cb=progress_cb,
+                    log_cb=log_cb,
                     cancel_flag=lambda: self.cancel_requested,
                 )
                 self.msg_queue.put(("status", f"[{idx}/{total_files}] Fertig -> {out_path}"))

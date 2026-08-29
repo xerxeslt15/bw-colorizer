@@ -55,13 +55,15 @@ class DDColorBackend:
         device: str = "cuda",
         model_name: str = "ddcolor_modelscope",
         input_size: int = 512,
-        saturation: float = 0.75,
-        temporal_smoothing: float = 0.7,
+        saturation: float = 0.45,
+        temporal_smoothing: float = 0.85,
         stats_smoothing: float = 0.9,
-        mean_shift_strength: float = 0.5,
+        mean_shift_strength: float = 0.0,  # standardmaessig AUS (siehe Hinweis unten)
         dropout_ratio_threshold: float = 0.5,
         dropout_smoothing: float = 0.9,
         spatial_blur_ksize: int = 0,  # 0 = automatisch aus Aufloesung berechnen
+        anchor_smoothing: float = 0.97,  # Glaettung fuer voellig ruhige Bereiche
+        motion_scale: float = 8.0,  # Pixel-Bewegung, ab der volle "Normal"-Glaettung gilt
     ):
         self.device = device
         self.model_name = model_name
@@ -77,6 +79,8 @@ class DDColorBackend:
         # zurueckgegriffen wird (0-1, hoeher = staerker).
         self.dropout_smoothing = dropout_smoothing
         self.spatial_blur_ksize = spatial_blur_ksize
+        self.anchor_smoothing = anchor_smoothing
+        self.motion_scale = motion_scale
 
         self._model = None
         self._torch_device = None
@@ -86,6 +90,15 @@ class DDColorBackend:
         self._running_mag = None  # fuer Aussetzer-Erkennung
 
     def load(self, log=print):
+        log(
+            f"[Backend-Version-Check] saturation={self.saturation}  "
+            f"temporal_smoothing={self.temporal_smoothing}  "
+            f"stats_smoothing={self.stats_smoothing}  "
+            f"spatial_blur_ksize={self.spatial_blur_ksize}  "
+            f"shadow/highlight-Taper aktiv=ja  mean_shift_strength={self.mean_shift_strength}  "
+            f"anchor_smoothing={self.anchor_smoothing}  motion_scale={self.motion_scale}  "
+            f"(Datei-Stand: 2026-08-29c-anker-v2)"
+        )
         if self._model is not None:
             return
 
@@ -161,15 +174,17 @@ class DDColorBackend:
 
         return min(ratio, 1.0)
 
-    def _warp_prev_ab(self, gray: np.ndarray) -> np.ndarray | None:
+    def _warp_prev_ab_with_motion(self, gray: np.ndarray):
         """Verschiebt die a/b-Kanaele des vorherigen Frames per Optical
-        Flow, damit sie zur Bewegung im aktuellen Frame passen. Gibt None
+        Flow, damit sie zur Bewegung im aktuellen Frame passen, und gibt
+        zusaetzlich eine Bewegungsstaerke pro Pixel zurueck (0 = komplett
+        ruhig/statisch, hoeher = staerkere Bewegung). Gibt (None, None)
         zurueck, wenn kein Vorgaenger vorhanden ist oder die Berechnung
-        fehlschlaegt (dann wird ohne Glaettung weitergemacht)."""
+        fehlschlaegt."""
         if self._prev_gray is None or self._prev_ab is None:
-            return None
+            return None, None
         if self._prev_gray.shape != gray.shape:
-            return None
+            return None, None
 
         try:
             flow = cv2.calcOpticalFlowFarneback(
@@ -185,9 +200,10 @@ class DDColorBackend:
                 self._prev_ab, map_x, map_y,
                 interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
             )
-            return warped
+            motion_mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
+            return warped, motion_mag
         except cv2.error:
-            return None
+            return None, None
 
     def colorize_frame(self, frame_bgr: np.ndarray) -> np.ndarray:
         if self._model is None:
@@ -235,6 +251,27 @@ class DDColorBackend:
         # 1) Saettigung daempfen
         output_ab_resized = output_ab_resized * self.saturation
 
+        # 1a) Farbe in sehr dunklen/hellen Bereichen zurueckdraengen -
+        #     aber NIE komplett auf 0 (das wuerde bei natuerlichem
+        #     Helligkeitsflackern alter Filmabtastungen selbst zu Farb-
+        #     Flackern fuehren, weil Pixel dann staendig die Schwelle
+        #     ueber-/unterschreiten wuerden). Weicher Uebergang
+        #     (smoothstep) statt harter linearer Kante, mit Mindestwert.
+        l_channel = orig_l[:, :, 0]  # bei float32-Eingabe liefert cv2 bereits 0..100
+        shadow_th, highlight_th = 14.0, 92.0
+        taper_floor = 0.4
+
+        def _smoothstep(t):
+            t = np.clip(t, 0, 1)
+            return t * t * (3 - 2 * t)
+
+        taper = np.ones_like(l_channel)
+        shadow_t = _smoothstep(l_channel / shadow_th)
+        taper = np.where(l_channel < shadow_th, taper_floor + (1 - taper_floor) * shadow_t, taper)
+        highlight_t = _smoothstep((100.0 - l_channel) / (100.0 - highlight_th))
+        taper = np.where(l_channel > highlight_th, taper_floor + (1 - taper_floor) * highlight_t, taper)
+        output_ab_resized = output_ab_resized * taper[:, :, None]
+
         # 1b) Raeumlich leicht weichzeichnen (nur Farbe, nicht Helligkeit!)
         #     Das entfernt feines, pixelnahes Farbrauschen, das von Frame zu
         #     Frame unabhaengig neu entsteht und als Flackern auffaellt -
@@ -253,19 +290,33 @@ class DDColorBackend:
         # 3) Aussetzer erkennen (Frame hat viel weniger Farbe als ueblich)
         dropout_ratio = self._detect_dropout_ratio(output_ab_resized)
 
-        # 4) Lokale, bewegungsausgeglichene Glaettung - bei erkanntem
-        #    Aussetzer deutlich staerker, um den Sprung zu S/W zu vermeiden
-        effective_smoothing = self.temporal_smoothing
+        # 4) Lokale Glaettung, ortsabhaengig nach Bewegungsstaerke:
+        #    Ruhige/statische Bildbereiche (z.B. ein stillstehender Hut)
+        #    bekommen eine sehr starke Farb-Fixierung (nahe eingefroren -
+        #    "Anker"), waehrend sich bewegende Bereiche normal auf neue
+        #    Vorhersagen reagieren koennen. Das begegnet direkt dem
+        #    beobachteten Muster: gerade unbewegte Flaechen zeigten trotz
+        #    hoher globaler Glaettung weiterhin langsames Farbdriften.
+        base_smoothing = self.temporal_smoothing
         if dropout_ratio < self.dropout_ratio_threshold:
-            effective_smoothing = max(self.temporal_smoothing, 0.85)
+            extra = (self.dropout_ratio_threshold - dropout_ratio) / self.dropout_ratio_threshold
+            max_extra_smoothing = 0.9
+            base_smoothing = self.temporal_smoothing + (max_extra_smoothing - self.temporal_smoothing) * extra
+            base_smoothing = min(base_smoothing, max_extra_smoothing)
 
-        if effective_smoothing > 0:
-            warped_prev_ab = self._warp_prev_ab(gray)
-            if warped_prev_ab is not None and warped_prev_ab.shape == output_ab_resized.shape:
-                output_ab_resized = (
-                    effective_smoothing * warped_prev_ab
-                    + (1 - effective_smoothing) * output_ab_resized
-                )
+        warped_prev_ab, motion_mag = self._warp_prev_ab_with_motion(gray)
+        if warped_prev_ab is not None and warped_prev_ab.shape == output_ab_resized.shape:
+            # Bewegungsstaerke 0..1 normalisieren (motion_scale Pixel
+            # Verschiebung = volle Bewegung, darueber hinaus wird gekappt)
+            motion_norm = np.clip(motion_mag / self.motion_scale, 0, 1)
+            # Bei Bewegung 0 -> anchor_smoothing (sehr stark), bei viel
+            # Bewegung -> base_smoothing (normal)
+            local_smoothing = self.anchor_smoothing - (self.anchor_smoothing - base_smoothing) * motion_norm
+            local_smoothing = local_smoothing[:, :, None]
+
+            output_ab_resized = (
+                local_smoothing * warped_prev_ab + (1 - local_smoothing) * output_ab_resized
+            )
 
         self._prev_ab = output_ab_resized
         self._prev_gray = gray
